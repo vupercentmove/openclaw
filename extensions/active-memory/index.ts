@@ -318,6 +318,18 @@ type TerminalMemorySearchWatch = {
 type CachedActiveRecallResult = {
   expiresAt: number;
   result: ActiveRecallResult;
+  // Only set for negatively-cached ("timeout") entries. Reuse requires the
+  // same runId and a different candidate model, which identifies a model
+  // fallback without suppressing same-model retries or later user turns.
+  runId?: string;
+  modelProviderId?: string;
+  modelId?: string;
+};
+
+type ActiveRecallTimeoutCacheScope = {
+  runId?: string;
+  modelProviderId?: string;
+  modelId?: string;
 };
 
 type ActiveMemoryChatType = "direct" | "group" | "channel" | "explicit";
@@ -1355,7 +1367,10 @@ function buildCacheKey(params: {
   return `${params.agentId}:${params.sessionKey ?? params.sessionId ?? "none"}:${hash}`;
 }
 
-function getCachedResult(cacheKey: string): ActiveRecallResult | undefined {
+function getCachedResult(
+  cacheKey: string,
+  scope: ActiveRecallTimeoutCacheScope = {},
+): ActiveRecallResult | undefined {
   const cached = activeRecallCache.get(cacheKey);
   if (!cached) {
     return undefined;
@@ -1369,10 +1384,33 @@ function getCachedResult(cacheKey: string): ActiveRecallResult | undefined {
     activeRecallCache.delete(cacheKey);
     return undefined;
   }
+  if (cached.result.status === "timeout") {
+    const hasStoredModel = Boolean(cached.modelProviderId && cached.modelId);
+    const hasCurrentModel = Boolean(scope.modelProviderId && scope.modelId);
+    const isDifferentCandidateModel =
+      cached.modelProviderId !== scope.modelProviderId || cached.modelId !== scope.modelId;
+    // Fail open unless this is a later model candidate in the same fallback
+    // run. Same-model retries and distinct user turns must attempt recall.
+    if (
+      !scope.runId ||
+      !cached.runId ||
+      cached.runId !== scope.runId ||
+      !hasStoredModel ||
+      !hasCurrentModel ||
+      !isDifferentCandidateModel
+    ) {
+      return undefined;
+    }
+  }
   return cached.result;
 }
 
-function setCachedResult(cacheKey: string, result: ActiveRecallResult, ttlMs: number): void {
+function setCachedResult(
+  cacheKey: string,
+  result: ActiveRecallResult,
+  ttlMs: number,
+  scope: ActiveRecallTimeoutCacheScope = {},
+): void {
   const rawNow = Date.now();
   const now = asDateTimestampMs(rawNow);
   if (
@@ -1395,6 +1433,9 @@ function setCachedResult(cacheKey: string, result: ActiveRecallResult, ttlMs: nu
   activeRecallCache.set(cacheKey, {
     expiresAt,
     result,
+    runId: result.status === "timeout" ? scope.runId : undefined,
+    modelProviderId: result.status === "timeout" ? scope.modelProviderId : undefined,
+    modelId: result.status === "timeout" ? scope.modelId : undefined,
   });
   while (activeRecallCache.size > DEFAULT_MAX_CACHE_ENTRIES) {
     const oldestKey = activeRecallCache.keys().next().value;
@@ -1439,7 +1480,13 @@ function toSingleLineLogValue(value: unknown): string {
 }
 
 function shouldCacheResult(result: ActiveRecallResult): boolean {
-  return result.status === "ok" && result.summary.length > 0;
+  // Cache plain "timeout" the same as "ok", but reuse it only for a different
+  // model candidate in the same fallback run. This does not remove or shorten
+  // the first configured recall timeout, and same-model retries still attempt
+  // recall normally.
+  // "timeout_partial" is excluded because it carries a real recovered
+  // summary, not a stable negative signal worth reusing.
+  return (result.status === "ok" && result.summary.length > 0) || result.status === "timeout";
 }
 
 function isUnavailableMemorySearchDebug(debug?: ActiveMemorySearchDebug): boolean {
@@ -3110,6 +3157,11 @@ async function maybeResolveActiveRecall(params: {
   currentModelProviderId?: string;
   currentModelId?: string;
   abortSignal?: AbortSignal;
+  // Identifies the model-fallback run this before_prompt_build invocation
+  // belongs to. Scopes negative ("timeout") cache reuse to that same run so a
+  // later, distinct user turn cannot be silently suppressed by a stale
+  // timeout (see getCachedResult).
+  runId?: string;
 }): Promise<ActiveRecallResult> {
   params.abortSignal?.throwIfAborted();
   const startedAt = Date.now();
@@ -3119,7 +3171,12 @@ async function maybeResolveActiveRecall(params: {
     sessionId: params.sessionId,
     query: params.query,
   });
-  const cached = getCachedResult(cacheKey);
+  const timeoutCacheScope: ActiveRecallTimeoutCacheScope = {
+    runId: params.runId,
+    modelProviderId: params.currentModelProviderId,
+    modelId: params.currentModelId,
+  };
+  const cached = getCachedResult(cacheKey, timeoutCacheScope);
   const resolvedModelRef = getModelRef(params.api, params.agentId, params.config, {
     modelProviderId: params.currentModelProviderId,
     modelId: params.currentModelId,
@@ -3320,6 +3377,9 @@ async function maybeResolveActiveRecall(params: {
         searchDebug: result.searchDebug,
       });
       params.abortSignal?.throwIfAborted();
+      if (shouldCacheResult(result)) {
+        setCachedResult(cacheKey, result, params.config.cacheTtlMs, timeoutCacheScope);
+      }
       return result;
     }
 
@@ -3347,7 +3407,7 @@ async function maybeResolveActiveRecall(params: {
       });
       params.abortSignal?.throwIfAborted();
       if (shouldCacheResult(result)) {
-        setCachedResult(cacheKey, result, params.config.cacheTtlMs);
+        setCachedResult(cacheKey, result, params.config.cacheTtlMs, timeoutCacheScope);
       }
       return result;
     }
@@ -3380,7 +3440,7 @@ async function maybeResolveActiveRecall(params: {
     });
     params.abortSignal?.throwIfAborted();
     if (shouldCacheResult(result)) {
-      setCachedResult(cacheKey, result, params.config.cacheTtlMs);
+      setCachedResult(cacheKey, result, params.config.cacheTtlMs, timeoutCacheScope);
     }
     return result;
   } catch (error) {
@@ -3421,6 +3481,9 @@ async function maybeResolveActiveRecall(params: {
         searchDebug: result.searchDebug,
       });
       params.abortSignal?.throwIfAborted();
+      if (shouldCacheResult(result)) {
+        setCachedResult(cacheKey, result, params.config.cacheTtlMs, timeoutCacheScope);
+      }
       return result;
     }
     const message = toSingleLineLogValue(error instanceof Error ? error.message : String(error));
@@ -3716,6 +3779,7 @@ export default definePluginEntry({
               currentModelProviderId: ctx.modelProviderId,
               currentModelId: ctx.modelId,
               abortSignal: deadlineController.signal,
+              runId: ctx.runId,
             });
             deadlineController.signal.throwIfAborted();
             if (!result.summary) {

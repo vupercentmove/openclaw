@@ -3265,7 +3265,7 @@ describe("active-memory plugin", () => {
     expect(debug?.hits).toBe(1);
   });
 
-  it("caches ok summaries but not empty, no-relevant, or timeout_partial results", () => {
+  it("caches ok summaries and timeouts but not empty, no-relevant, or timeout_partial results", () => {
     expect(
       testing.shouldCacheResult({
         status: "timeout_partial",
@@ -3283,6 +3283,13 @@ describe("active-memory plugin", () => {
     ).toBe(true);
     expect(
       testing.shouldCacheResult({
+        status: "timeout",
+        elapsedMs: 1,
+        summary: null,
+      }),
+    ).toBe(true);
+    expect(
+      testing.shouldCacheResult({
         status: "empty",
         elapsedMs: 1,
         summary: null,
@@ -3295,6 +3302,70 @@ describe("active-memory plugin", () => {
         summary: null,
       }),
     ).toBe(false);
+  });
+
+  it("reuses cached timeouts only for a different model in the same run", () => {
+    const cacheKey = testing.buildCacheKey({
+      agentId: "main",
+      sessionKey: "agent:main:runid-scope",
+      query: "runid scope prompt",
+    });
+    const timeoutResult = { status: "timeout" as const, elapsedMs: 1, summary: null };
+    testing.setCachedResult(cacheKey, timeoutResult, 15_000, {
+      runId: "run-1",
+      modelProviderId: "openai",
+      modelId: "gpt-primary",
+    });
+
+    expect(
+      testing.getCachedResult(cacheKey, {
+        runId: "run-1",
+        modelProviderId: "anthropic",
+        modelId: "claude-fallback",
+      }),
+    ).toEqual(timeoutResult);
+    expect(
+      testing.getCachedResult(cacheKey, {
+        runId: "run-1",
+        modelProviderId: "openai",
+        modelId: "gpt-primary",
+      }),
+    ).toBeUndefined();
+    expect(
+      testing.getCachedResult(cacheKey, {
+        runId: "run-2",
+        modelProviderId: "anthropic",
+        modelId: "claude-fallback",
+      }),
+    ).toBeUndefined();
+    expect(testing.getCachedResult(cacheKey)).toBeUndefined();
+
+    const okCacheKey = testing.buildCacheKey({
+      agentId: "main",
+      sessionKey: "agent:main:runid-scope-ok",
+      query: "runid scope ok prompt",
+    });
+    const okResult = {
+      status: "ok" as const,
+      elapsedMs: 1,
+      rawReply: "memory",
+      summary: "memory",
+    };
+    // Successful summary caching keeps its existing semantics: no runId
+    // requirement to reuse it.
+    testing.setCachedResult(okCacheKey, okResult, 15_000, {
+      runId: "run-1",
+      modelProviderId: "openai",
+      modelId: "gpt-primary",
+    });
+    expect(
+      testing.getCachedResult(okCacheKey, {
+        runId: "run-2",
+        modelProviderId: "anthropic",
+        modelId: "claude-fallback",
+      }),
+    ).toEqual(okResult);
+    expect(testing.getCachedResult(okCacheKey)).toEqual(okResult);
   });
 
   it("does not cache no-relevant-memory recall results", async () => {
@@ -3354,56 +3425,136 @@ describe("active-memory plugin", () => {
     );
   });
 
-  it("does not cache timeout results", async () => {
+  it("caches timeouts across model fallback candidates in the same run", async () => {
+    const CONFIGURED_TIMEOUT_MS = 25;
     testing.setMinimumTimeoutMsForTests(1);
     testing.setSetupGraceTimeoutMsForTests(0);
     api.pluginConfig = {
       agents: ["main"],
-      timeoutMs: 1,
+      timeoutMs: CONFIGURED_TIMEOUT_MS,
       logging: true,
     };
     plugin.register(api as unknown as OpenClawPluginApi);
-    let lastAbortSignal: AbortSignal | undefined;
-    runEmbeddedAgent.mockImplementation(async (params: { abortSignal?: AbortSignal }) => {
-      lastAbortSignal = params.abortSignal;
-      return await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          params.abortSignal?.removeEventListener("abort", abortHandler);
-          resolve({ payloads: [] });
-        }, 2_000);
-        const abortHandler = () => {
-          clearTimeout(timer);
-          reject(new Error("aborted"));
-        };
-        params.abortSignal?.addEventListener("abort", abortHandler, { once: true });
-      });
+    // Simulate a stuck memory backend: the recall subagent never settles and
+    // never checks its abort signal, like a hung model-fallback candidate.
+    runEmbeddedAgent.mockImplementation(() => new Promise<never>(() => {}));
+
+    const hookCtx = {
+      agentId: "main",
+      trigger: "user",
+      sessionKey: "agent:main:timeout-test",
+      messageProvider: "webchat",
+      runId: "run-1",
+      modelProviderId: "openai",
+      modelId: "gpt-primary",
+    };
+    const event = { prompt: "what wings should i order? timeout test", messages: [] };
+
+    const firstResult = await hooks.before_prompt_build(event, hookCtx);
+    expect(firstResult).toBeUndefined();
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
+
+    // The same-run retry must reuse the cached timeout result deterministically
+    // instead of invoking the stuck backend again — evidenced by the call
+    // count staying at 1 and the "cached status=timeout" log line, not by
+    // wall-clock timing.
+    const secondResult = await hooks.before_prompt_build(event, {
+      ...hookCtx,
+      modelProviderId: "anthropic",
+      modelId: "claude-fallback",
     });
 
-    await hooks.before_prompt_build(
-      { prompt: "what wings should i order? timeout test", messages: [] },
-      {
-        agentId: "main",
-        trigger: "user",
-        sessionKey: "agent:main:timeout-test",
-        messageProvider: "webchat",
-      },
-    );
-    await hooks.before_prompt_build(
-      { prompt: "what wings should i order? timeout test", messages: [] },
-      {
-        agentId: "main",
-        trigger: "user",
-        sessionKey: "agent:main:timeout-test",
-        messageProvider: "webchat",
-      },
-    );
+    expect(secondResult).toBeUndefined();
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
 
-    expect(hoisted.updateSessionStore).toHaveBeenCalledTimes(2);
-    expect(lastAbortSignal?.aborted).toBe(true);
     const infoLines = vi
       .mocked(api.logger.info)
       .mock.calls.map((call: unknown[]) => String(call[0]));
-    expectLinesNotToContain(infoLines, " cached ");
+    expectLinesToContain(infoLines, "cached status=timeout");
+  });
+
+  it("re-invokes the backend for a same-model retry in the same run", async () => {
+    const CONFIGURED_TIMEOUT_MS = 25;
+    testing.setMinimumTimeoutMsForTests(1);
+    testing.setSetupGraceTimeoutMsForTests(0);
+    api.pluginConfig = {
+      agents: ["main"],
+      timeoutMs: CONFIGURED_TIMEOUT_MS,
+      logging: true,
+    };
+    plugin.register(api as unknown as OpenClawPluginApi);
+    runEmbeddedAgent.mockImplementation(() => new Promise<never>(() => {}));
+
+    const hookCtx = {
+      agentId: "main",
+      trigger: "user",
+      sessionKey: "agent:main:timeout-test-same-model",
+      messageProvider: "webchat",
+      runId: "run-1",
+      modelProviderId: "openai",
+      modelId: "gpt-primary",
+    };
+    const event = {
+      prompt: "what wings should i order? timeout test same model",
+      messages: [],
+    };
+
+    await hooks.before_prompt_build(event, hookCtx);
+    await hooks.before_prompt_build(event, hookCtx);
+
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-invokes the backend on a distinct runId even with the same session and query", async () => {
+    const CONFIGURED_TIMEOUT_MS = 25;
+    testing.setMinimumTimeoutMsForTests(1);
+    testing.setSetupGraceTimeoutMsForTests(0);
+    api.pluginConfig = {
+      agents: ["main"],
+      timeoutMs: CONFIGURED_TIMEOUT_MS,
+      logging: true,
+    };
+    plugin.register(api as unknown as OpenClawPluginApi);
+    // Simulate a stuck memory backend: the recall subagent never settles and
+    // never checks its abort signal, like a hung model-fallback candidate.
+    runEmbeddedAgent.mockImplementation(() => new Promise<never>(() => {}));
+
+    const baseHookCtx = {
+      agentId: "main",
+      trigger: "user",
+      sessionKey: "agent:main:timeout-test-new-run",
+      messageProvider: "webchat",
+      modelProviderId: "openai",
+      modelId: "gpt-primary",
+    };
+    const event = {
+      prompt: "what wings should i order? timeout test new run",
+      messages: [],
+    };
+
+    const firstResult = await hooks.before_prompt_build(event, {
+      ...baseHookCtx,
+      runId: "run-1",
+    });
+    expect(firstResult).toBeUndefined();
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
+
+    // A distinct user turn (different runId) that happens to repeat the same
+    // session + query text within the cache TTL must not be suppressed by the
+    // prior run's negatively-cached timeout — the backend is invoked again.
+    const secondResult = await hooks.before_prompt_build(event, {
+      ...baseHookCtx,
+      runId: "run-2",
+      modelProviderId: "anthropic",
+      modelId: "claude-fallback",
+    });
+    expect(secondResult).toBeUndefined();
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(2);
+
+    const infoLines = vi
+      .mocked(api.logger.info)
+      .mock.calls.map((call: unknown[]) => String(call[0]));
+    expect(infoLines.filter((line) => line.includes("cached status=timeout"))).toHaveLength(0);
   });
 
   it("releases memory search managers after active-memory timeouts", async () => {
