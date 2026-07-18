@@ -1030,6 +1030,12 @@ export const AgentModelRuntimeEntrySchema = z
   })
   .strict();
 
+export const AgentModelPolicySchema = z
+  .object({
+    allow: z.array(z.string()).optional(),
+  })
+  .strict();
+
 export const AgentEntrySchema = z
   .object({
     id: z.string(),
@@ -1041,6 +1047,7 @@ export const AgentEntrySchema = z
     model: AgentModelSchema.optional(),
     utilityModel: z.string().optional(),
     models: z.record(z.string(), AgentModelRuntimeEntrySchema).optional(),
+    modelPolicy: AgentModelPolicySchema.optional(),
     thinkingDefault: z
       .enum(["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max", "ultra"])
       .optional(),

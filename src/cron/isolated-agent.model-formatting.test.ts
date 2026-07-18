@@ -247,7 +247,29 @@ describe("cron model formatting and precedence edge cases", () => {
       ).resolves.toEqual({
         ok: false,
         error:
-          "cron payload.model 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.models allowlist: anthropic/claude-sonnet-4-6 is not in [(none configured)]",
+          "cron payload.model 'anthropic/claude-sonnet-4-6' rejected by agents.defaults.modelPolicy.allow: anthropic/claude-sonnet-4-6 is not in [(none configured)]",
+      });
+    });
+
+    it("reports the active per-agent allowlist path and refs", async () => {
+      resolveAllowedModelRefMock.mockReturnValueOnce({
+        error: "model not allowed: openai/gpt-5.5",
+      });
+
+      await expect(
+        selectModel({
+          agentId: "ops",
+          cfg: {
+            agents: {
+              list: [{ id: "ops", modelPolicy: { allow: ["anthropic/*"] } }],
+            },
+          },
+          payload: { kind: "agentTurn", message: DEFAULT_MESSAGE, model: "openai/gpt-5.5" },
+        }),
+      ).resolves.toEqual({
+        ok: false,
+        error:
+          "cron payload.model 'openai/gpt-5.5' rejected by agents.list[].modelPolicy.allow: openai/gpt-5.5 is not in [anthropic/*]",
       });
     });
 

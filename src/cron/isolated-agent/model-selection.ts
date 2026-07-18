@@ -1,3 +1,4 @@
+import { resolveConfiguredModelPolicyAllow } from "../../agents/model-selection-shared.js";
 /** Resolves provider/model precedence for isolated cron runs. */
 import type { AgentConfig } from "../../config/types.agents.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -45,23 +46,26 @@ type ResolveCronModelSelectionResult =
       error: string;
     };
 
-function formatAllowedModelRefs(params: { cfg: OpenClawConfig }): string {
-  const configured = params.cfg.agents?.defaults?.models;
-  if (configured && typeof configured === "object" && Object.keys(configured).length > 0) {
-    return Object.keys(configured).toSorted().join(", ");
+function formatAllowedModelRefs(params: { cfg: OpenClawConfig; agentId?: string }): string {
+  const configured = resolveConfiguredModelPolicyAllow(params).refs;
+  if (configured && configured.length > 0) {
+    return configured.toSorted().join(", ");
   }
   return "(none configured)";
 }
 
 function formatCronPayloadModelRejection(params: {
   cfg: OpenClawConfig;
+  agentId?: string;
   modelOverride: string;
   error: string;
 }): string {
   const { modelOverride, error } = params;
   if (error.startsWith("model not allowed:")) {
     const modelRef = error.slice("model not allowed:".length).trim();
-    return `cron payload.model '${modelOverride}' rejected by agents.defaults.models allowlist: ${modelRef} is not in [${formatAllowedModelRefs({ cfg: params.cfg })}]`;
+    const policy = resolveConfiguredModelPolicyAllow(params);
+    const policyPath = policy.configPath ?? "agents.defaults.modelPolicy.allow";
+    return `cron payload.model '${modelOverride}' rejected by ${policyPath}: ${modelRef} is not in [${formatAllowedModelRefs(params)}]`;
   }
   return `cron payload.model '${modelOverride}' rejected: ${error}`;
 }
@@ -154,6 +158,7 @@ export async function resolveCronModelSelection(
         ok: false,
         error: formatCronPayloadModelRejection({
           cfg: params.cfgWithAgentDefaults,
+          agentId: params.agentId,
           modelOverride,
           error: resolvedOverride.error,
         }),

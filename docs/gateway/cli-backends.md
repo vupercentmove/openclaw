@@ -69,7 +69,7 @@ Add the CLI backend to your fallback list so it only runs when primary models fa
 }
 ```
 
-If you use `agents.defaults.models` as an allowlist, include your CLI backend models there too. When the primary provider fails (auth, rate limits, timeouts), OpenClaw tries the CLI backend next.
+If you configure `agents.defaults.modelPolicy.allow`, include your CLI backend models there too. `agents.defaults.models` only owns per-model aliases, parameters, and metadata. When the primary provider fails (auth, rate limits, timeouts), OpenClaw tries the CLI backend next.
 
 ## Configuration
 
