@@ -2707,6 +2707,76 @@ describe("createTelegramBot", () => {
     expect(sendMessageSpy).not.toHaveBeenCalled();
   });
 
+  it("dispatches an authorized human's edited group message instead of dropping it", async () => {
+    loadConfig.mockReturnValue({
+      channels: {
+        telegram: {
+          groupPolicy: "allowlist",
+          allowFrom: ["123456789"],
+          groups: { "*": { requireMention: false } },
+        },
+      },
+    });
+    readChannelAllowFromStore.mockResolvedValue([]);
+    sendMessageSpy.mockClear();
+    replySpy.mockClear();
+
+    createTelegramBot({ token: "tok" });
+    const editedHandler = getOnHandler("edited_message") as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await editedHandler({
+      editedMessage: {
+        chat: { id: -100123456789, type: "group", title: "Test Group" },
+        message_id: 418,
+        date: 1736380800,
+        edit_date: 1736380810,
+        text: "edited authorized group prompt",
+        from: { id: 123456789, username: "allowed" },
+      },
+      me: { username: "openclaw_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send a pairing challenge for an authorized human's edited DM, but still dispatches it", async () => {
+    loadConfig.mockReturnValue({
+      channels: {
+        telegram: {
+          dmPolicy: "allowlist",
+          allowFrom: ["123456789"],
+        },
+      },
+    });
+    readChannelAllowFromStore.mockResolvedValue([]);
+    sendMessageSpy.mockClear();
+    replySpy.mockClear();
+
+    createTelegramBot({ token: "tok" });
+    const editedHandler = getOnHandler("edited_message") as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+
+    await editedHandler({
+      editedMessage: {
+        chat: { id: 5678, type: "private" },
+        message_id: 419,
+        date: 1736380800,
+        edit_date: 1736380810,
+        text: "edited authorized dm prompt",
+        from: { id: 123456789, username: "allowed" },
+      },
+      me: { username: "openclaw_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    });
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+  });
+
   it("drops topic-required root DMs before pairing challenges", async () => {
     loadConfig.mockReturnValue({
       channels: {
