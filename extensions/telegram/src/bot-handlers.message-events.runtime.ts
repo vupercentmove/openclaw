@@ -54,6 +54,7 @@ export function registerTelegramMessageHandlers(
     sendOversizeWarning: boolean;
     oversizeLogMessage: string;
     errorMessage: string;
+    dmAccess: "challenge" | "silent";
   };
 
   const normalizeChannelPostMessage = (post: Message): Message => {
@@ -137,7 +138,7 @@ export function registerTelegramMessageHandlers(
         senderId: event.senderId,
         senderUsername: event.senderUsername,
         requireConfiguredGroup: event.requireConfiguredGroup,
-        dmAccess: "challenge",
+        dmAccess: event.dmAccess,
       });
       if (!gate.allowed) {
         return;
@@ -269,6 +270,7 @@ export function registerTelegramMessageHandlers(
       sendOversizeWarning: true,
       oversizeLogMessage: "media exceeds size limit",
       errorMessage: "handler failed",
+      dmAccess: "challenge",
     });
   });
 
@@ -277,11 +279,47 @@ export function registerTelegramMessageHandlers(
     if (!msg) {
       return;
     }
-    await recordEditedMessageForReplyChain({
+    // Other participants' (and this bot's own) edits only update cached reply-chain
+    // content — e.g. another bot finalizing a streamed answer in place. A human
+    // editing their own message is a new prompt (fixing a typo, adding the mention
+    // the bot requires) and must run the normal authorize+dispatch pipeline, or it
+    // silently never gets a response.
+    if (msg.from?.is_bot) {
+      await recordEditedMessageForReplyChain({
+        ctxForDedupe: ctx,
+        msg,
+        requireConfiguredGroup: false,
+        botUserId: ctx.me?.id ?? opts.botInfo?.id,
+      });
+      return;
+    }
+    const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+    const isForum = await resolveTelegramForumFlag({
+      chatId: msg.chat.id,
+      chatType: msg.chat.type,
+      isGroup,
+      isForum: msg.chat.is_forum,
+      isTopicMessage: msg.is_topic_message,
+      getChat,
+    });
+    const normalizedMsg = withResolvedTelegramForumFlag(msg, isForum);
+    await handleInboundMessageLike({
       ctxForDedupe: ctx,
-      msg,
+      ctx: buildSyntheticContext(ctx, normalizedMsg),
+      msg: normalizedMsg,
+      chatId: normalizedMsg.chat.id,
+      isGroup,
+      isForum,
+      messageThreadId: normalizedMsg.message_thread_id,
+      senderId: normalizedMsg.from?.id != null ? String(normalizedMsg.from.id) : "",
+      senderUsername: normalizedMsg.from?.username ?? "",
       requireConfiguredGroup: false,
-      botUserId: ctx.me?.id ?? opts.botInfo?.id,
+      sendOversizeWarning: true,
+      oversizeLogMessage: "media exceeds size limit",
+      errorMessage: "edited message handler failed",
+      // Never send a DM pairing challenge off an edit — only a fresh message may
+      // prompt an unpaired sender (see authorizeInboundMessage's dmAccess contract).
+      dmAccess: "silent",
     });
   });
 
@@ -315,6 +353,7 @@ export function registerTelegramMessageHandlers(
       sendOversizeWarning: false,
       oversizeLogMessage: "channel post media exceeds size limit",
       errorMessage: "channel_post handler failed",
+      dmAccess: "challenge",
     });
   });
 

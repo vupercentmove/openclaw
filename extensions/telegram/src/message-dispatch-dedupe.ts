@@ -78,7 +78,13 @@ function buildTelegramMessageDispatchReplayKey(msg: Message): string | null {
   if (chatId == null || typeof messageId !== "number" || messageId <= 0) {
     return null;
   }
-  return JSON.stringify(["message", String(chatId), messageId]);
+  // Edited messages reuse the original message_id, so a bare (chat, message_id)
+  // key would make an edit collide with — and get silently dropped by — the
+  // original send's dedupe claim. Folding edit_date in gives each distinct
+  // edit its own claim while still deduping redelivery of that same edit.
+  return msg.edit_date != null
+    ? JSON.stringify(["message", String(chatId), messageId, msg.edit_date])
+    : JSON.stringify(["message", String(chatId), messageId]);
 }
 
 export function buildTelegramMessageDispatchAccountReplayKey(params: {
