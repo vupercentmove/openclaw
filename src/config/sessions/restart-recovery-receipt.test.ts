@@ -54,11 +54,23 @@ describe("restart recovery terminal delivery receipt", () => {
     ).toBe("delivered-terminal");
   });
 
-  it("blocks a repeated terminal send while its outcome is already durable", async () => {
+  it("blocks a concurrent terminal send while the prior one is still pending", async () => {
     await seedClaim();
     await beginRestartRecoveryTerminalDelivery(scope());
 
     await expect(beginRestartRecoveryTerminalDelivery(scope())).resolves.toBe("blocked");
+  });
+
+  it("re-arms a later send in the same live turn once the prior delivery settled", async () => {
+    await seedClaim();
+    await beginRestartRecoveryTerminalDelivery(scope());
+    await completeRestartRecoveryTerminalDelivery(scope());
+
+    const followUp = { ...scope(), toolCallId: "message-call-2" };
+    await expect(beginRestartRecoveryTerminalDelivery(followUp)).resolves.toBe("started");
+    const entry = loadSessionEntry({ sessionKey, storePath: fixture.storePath() });
+    expect(entry?.restartRecoveryDeliveryReceiptState).toBe("terminal-pending");
+    expect(entry?.restartRecoveryDeliveryToolCallId).toBe("message-call-2");
   });
 
   it.each([undefined, "done" as const])(

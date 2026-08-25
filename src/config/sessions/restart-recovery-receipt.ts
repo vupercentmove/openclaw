@@ -43,6 +43,20 @@ function hasClaimlessLiveDeliveryState(
   );
 }
 
+/**
+ * One source turn may legitimately send more than once: the agent posts a
+ * progress note, then the real answer. Re-arming is safe only while the same
+ * claim is still live and the prior terminal send already settled. A
+ * still-pending send is genuine delivery ambiguity, and a released claim means
+ * the turn already finished — both must stay fail-closed.
+ */
+function canArmTerminalDelivery(entry: SessionEntry): boolean {
+  if (!entry.restartRecoveryDeliveryReceiptState && !entry.restartRecoveryDeliveryToolCallId) {
+    return true;
+  }
+  return entry.restartRecoveryDeliveryReceiptState === "delivered-terminal";
+}
+
 function loadCurrent(scope: RestartRecoveryTerminalDeliveryScope): SessionEntry | undefined {
   return loadSessionEntry({
     sessionKey: scope.sessionKey,
@@ -59,11 +73,7 @@ export async function beginRestartRecoveryTerminalDelivery(
   const updated = await updateSessionEntry(
     { sessionKey: scope.sessionKey, storePath: scope.storePath },
     (entry) => {
-      if (
-        !hasActiveClaim(entry, scope) ||
-        entry.restartRecoveryDeliveryReceiptState ||
-        entry.restartRecoveryDeliveryToolCallId
-      ) {
+      if (!hasActiveClaim(entry, scope) || !canArmTerminalDelivery(entry)) {
         return null;
       }
       started = true;
