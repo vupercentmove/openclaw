@@ -4,7 +4,9 @@ import {
   buildChannelProgressDraftLineForEntry,
   createChannelProgressDraftCompositor,
   isChannelProgressDraftWorkToolName,
+  resolveChannelStreamingPreviewCommandText,
   resolveChannelStreamingPreviewToolProgress,
+  resolveChannelStreamingProgressNarration,
   type ChannelProgressDraftLine,
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
@@ -108,6 +110,19 @@ export function createTelegramProgressController(params: {
     suppress: () => compositor.suppress(),
   });
 
+  // Utility-model narration keeps the draft speaking during long quiet stretches,
+  // where the model emits no preamble and no tool line. Gating on the answer
+  // stream (not `!isRoomEvent`) is load-bearing: room events never build one, so
+  // the callbacks stay off for message_tool_only turns.
+  const narrationProgressEnabled =
+    Boolean(answerLane.stream) &&
+    params.streamMode === "progress" &&
+    resolveChannelStreamingProgressNarration(params.telegramCfg);
+  const narrationHideCommandText =
+    narrationProgressEnabled &&
+    resolveChannelStreamingPreviewCommandText(params.telegramCfg) === "status";
+  let progressNarratorLifecycle: { beginTurn: () => void; stopTurn: () => void } | undefined;
+
   const canPushToolProgress = () =>
     Boolean(
       answerLane.stream &&
@@ -139,6 +154,15 @@ export function createTelegramProgressController(params: {
       snapshot: payload.isReasoningSnapshot === true,
     });
   };
+  // Narration is a status slot, not a work line, so it deliberately skips
+  // `canPushToolProgress`: a `toolProgress: false` setup still wants the headline.
+  // The compositor already refuses pushes once the final reply starts.
+  const pushNarrationProgress = async (text: string) => {
+    if (verboseProgressActive()) {
+      return false;
+    }
+    return await compositor.pushNarrationProgress(text);
+  };
   const pushThinkingTokenProgress = async (progressTokens: number) => {
     const rendered = await pushToolProgress(buildTelegramThinkingProgressLine(progressTokens), {
       startImmediately: true,
@@ -152,6 +176,7 @@ export function createTelegramProgressController(params: {
   const markFinalStarted = () => {
     finalAnswerDeliveryStarted = true;
     compositor.markFinalReplyStarted();
+    progressNarratorLifecycle?.stopTurn();
   };
   const markFinalDelivered = () => {
     finalAnswerDelivered = true;
@@ -338,17 +363,28 @@ export function createTelegramProgressController(params: {
     handlePatchSummary,
     handlePlanUpdate,
     handleToolStart,
+    // Parks the narrator on its visibility retry instead of spending utility-model
+    // calls while core renders standalone verbose progress the draft cannot show.
+    isProgressDraftVisible: () => compositor.isVisible && !verboseProgressActive(),
     markFinalDelivered,
     markFinalStarted,
+    narrationHideCommandText,
+    narrationProgressEnabled,
     markSawFinal: () => {
       sawProgressFinal = true;
     },
     progressPreambleEnabled:
       params.streamMode === "progress" && answerLane.stream ? true : undefined,
+    pushNarrationProgress,
     pushReasoningProgress,
     pushThinkingTokenProgress,
     pushToolProgress,
     reset: () => compositor.reset(),
+    // Telegram never reopens a settled draft (no `beginNewTurn` call site), so the
+    // narrator covers the primary turn only; `beginTurn` stays unused by design.
+    setProgressNarratorLifecycle: (lifecycle: { beginTurn: () => void; stopTurn: () => void }) => {
+      progressNarratorLifecycle = lifecycle;
+    },
     resetAnswerLaneAfterCollapse,
     resolveCollapseSummaryLine,
     sawProgressFinal: () => sawProgressFinal,
