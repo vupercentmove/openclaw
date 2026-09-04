@@ -224,6 +224,20 @@ export async function runTelegramDispatchTurn(params: {
                 ? params.progress.commentaryProgressEnabled
                 : undefined,
             progressPreambleEnabled: params.progress.progressPreambleEnabled,
+            // Passing onNarrationUpdate is what opts this channel into utility-model
+            // narration; core skips it entirely when no utility model resolves.
+            onNarrationUpdate: params.progress.narrationProgressEnabled
+              ? async (payload) => {
+                  await params.progress.pushNarrationProgress(payload.text);
+                }
+              : undefined,
+            onProgressNarratorLifecycle: params.progress.narrationProgressEnabled
+              ? (lifecycle) => params.progress.setProgressNarratorLifecycle(lifecycle)
+              : undefined,
+            isProgressDraftVisible: params.progress.narrationProgressEnabled
+              ? () => params.progress.isProgressDraftVisible()
+              : undefined,
+            narrationHideCommandText: params.progress.narrationHideCommandText ? true : undefined,
             reasoningPayloadsEnabled: params.draft.durableReasoningPayloadsEnabled,
             onToolStart: params.progress.handleToolStart,
             onItemEvent: params.progress.handleItemEvent,

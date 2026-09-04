@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   describeTelegramDispatch,
   createContext,
@@ -743,5 +743,145 @@ describeTelegramDispatch("dispatchTelegramMessage progress-updates", () => {
     expect(draftStream.updatePreview).toHaveBeenCalledWith(
       telegramProgressPreview("Shelling\n\n🛠️ Exec", "<b>Shelling</b>\n<b>🛠️ Exec</b>"),
     );
+  });
+
+  it("renders utility-model narration in the progress draft", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      await replyOptions?.onReplyStart?.();
+      await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+      await replyOptions?.onNarrationUpdate?.({ text: "Reading the gateway config." });
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: { streaming: { mode: "progress", progress: { label: "Shelling" } } },
+    });
+
+    // Narration takes the status headline and the work lines keep accumulating
+    // underneath — this headline is what fills long quiet stretches.
+    expect(draftStream.updatePreview).toHaveBeenCalledWith(
+      telegramProgressPreview(
+        "Shelling\n\nReading the gateway config.\n🛠️ Exec",
+        "<b>Shelling</b>\nReading the gateway config.\n<b>🛠️ Exec</b>",
+      ),
+    );
+  });
+
+  it("keeps a fresh model preamble ahead of narration", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      await replyOptions?.onReplyStart?.();
+      await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+      await replyOptions?.onItemEvent?.({
+        kind: "preamble",
+        itemId: "c1",
+        progressText: "Checking the sheet",
+      });
+      await replyOptions?.onNarrationUpdate?.({ text: "Utility filler text." });
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: { streaming: { mode: "progress", progress: { label: "Shelling" } } },
+    });
+
+    const previews = draftStream.updatePreview.mock.calls.map(([preview]) => preview);
+    expect(previews.at(-1)?.text).toContain("Checking the sheet");
+    expect(previews.at(-1)?.text).not.toContain("Utility filler text.");
+  });
+
+  it("omits narration callbacks when progress narration is disabled", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    let seen: Record<string, unknown> | undefined;
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      seen = replyOptions as Record<string, unknown>;
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: {
+        streaming: { mode: "progress", progress: { label: "Shelling", narration: false } },
+      },
+    });
+
+    expect(seen?.onNarrationUpdate).toBeUndefined();
+    expect(seen?.onProgressNarratorLifecycle).toBeUndefined();
+    expect(seen?.isProgressDraftVisible).toBeUndefined();
+  });
+
+  it("omits narration callbacks outside progress mode", async () => {
+    // Telegram defaults to `partial`; narration must stay off there so default
+    // installs never start paying for utility-model calls.
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    let seen: Record<string, unknown> | undefined;
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      seen = replyOptions as Record<string, unknown>;
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(seen?.onNarrationUpdate).toBeUndefined();
+  });
+
+  it("mirrors status-only command text into the narration input policy", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    let seen: Record<string, unknown> | undefined;
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      seen = replyOptions as Record<string, unknown>;
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: {
+        streaming: { mode: "progress", progress: { label: "Shelling", commandText: "status" } },
+      },
+    });
+
+    expect(seen?.narrationHideCommandText).toBe(true);
+  });
+
+  it("stops the narrator at the final answer without reopening the turn", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    const beginTurn = vi.fn();
+    const stopTurn = vi.fn();
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onReplyStart?.();
+        replyOptions?.onProgressNarratorLifecycle?.({ beginTurn, stopTurn });
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver({ text: "Done" }, { kind: "final" });
+        return { queuedFinal: false };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: { streaming: { mode: "progress", progress: { label: "Shelling" } } },
+    });
+
+    expect(stopTurn).toHaveBeenCalled();
+    // Telegram never reopens a settled draft, so `beginTurn` stays unused here.
+    expect(beginTurn).not.toHaveBeenCalled();
   });
 });
